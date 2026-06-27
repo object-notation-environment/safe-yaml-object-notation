@@ -65,7 +65,7 @@ scalar_value = { dq_scalar | plain_scalar }
 // ---------------------------------------------------------------------------
 
 inline_comment_text = { not_nl* }
-inline_comment      = { SP ~ "#" ~ (SP ~ inline_comment_text | &NEWLINE) }
+trailing_comment    = { SP ~ "#" ~ (SP ~ inline_comment_text | &NEWLINE) }
 
 // ---------------------------------------------------------------------------
 // Comment line
@@ -73,7 +73,7 @@ inline_comment      = { SP ~ "#" ~ (SP ~ inline_comment_text | &NEWLINE) }
 
 comment_text = { not_nl* }
 // A full-line comment: indent, then "# " or "#\n"
-comment_line = { indent ~ "#" ~ (SP ~ comment_text | &(NEWLINE | EOI)) ~ (NEWLINE | EOI) }
+comment = { indent ~ "#" ~ (SP ~ comment_text | &(NEWLINE | EOI)) ~ (NEWLINE | EOI) }
 
 // ---------------------------------------------------------------------------
 // Literal block  [[[  …  ]]]
@@ -84,7 +84,7 @@ literal_close   = _{ "]]]" }
 // raw line: anything that is NOT the close delimiter
 literal_raw_line = { (!literal_close ~ not_nl)* ~ NEWLINE }
 literal_content  = { literal_raw_line* }
-literal_block    = { literal_open ~ literal_content ~ literal_close ~ (NEWLINE | EOI) }
+literal_node    = { literal_open ~ literal_content ~ literal_close ~ (NEWLINE | EOI) }
 
 // ---------------------------------------------------------------------------
 // Document fence (Block 2) — triple-backtick, column 0 only
@@ -94,8 +94,8 @@ path_char    = _{ !("." | NEWLINE) ~ ANY }
 format_char  = _{ !(NEWLINE) ~ ANY }
 fence_path   = { path_char* }
 fence_format = { format_char+ }
-doc_fence_open  = { "```" ~ fence_path ~ "." ~ fence_format ~ NEWLINE }
-doc_fence_close = { "```" ~ (NEWLINE | EOI) }
+fence_open  = { "```" ~ fence_path ~ "." ~ fence_format ~ NEWLINE }
+fence_close = { "```" ~ (NEWLINE | EOI) }
 
 // ---------------------------------------------------------------------------
 // Values (recursive)
@@ -104,7 +104,7 @@ doc_fence_close = { "```" ~ (NEWLINE | EOI) }
 // A value on the same line as a key or list-item marker.
 // It can be a literal block, a nested block (mapping/sequence started on
 // next line — represented here as empty), or a scalar.
-inline_value = { literal_block | scalar_value }
+inline_value = { literal_node | scalar_value }
 
 // ---------------------------------------------------------------------------
 // Key-value entry
@@ -112,9 +112,9 @@ inline_value = { literal_block | scalar_value }
 
 colon_operator = _{ ":" ~ (SP | &NEWLINE | &EOI) }
 
-key_value = {
+mapping_entry = {
     indent ~ key_body ~ colon_operator ~
-    (inline_value ~ inline_comment? | inline_comment | &(NEWLINE | EOI)) ~
+    (inline_value ~ trailing_comment? | trailing_comment | &(NEWLINE | EOI)) ~
     (NEWLINE | EOI)
 }
 
@@ -124,9 +124,9 @@ key_value = {
 
 dash_operator = _{ "-" ~ (SP | &NEWLINE | &EOI) }
 
-list_item = {
+sequence_item = {
     indent ~ dash_operator ~
-    (inline_value ~ inline_comment? | inline_comment | &(NEWLINE | EOI)) ~
+    (inline_value ~ trailing_comment? | trailing_comment | &(NEWLINE | EOI)) ~
     (NEWLINE | EOI)
 }
 
@@ -134,18 +134,18 @@ list_item = {
 // Block: a mapping, sequence, or scalar block
 // ---------------------------------------------------------------------------
 
-block_line = _{
+statement = _{
     blank_line
-  | comment_line
-  | key_value
-  | list_item
-  | literal_block
-  | doc_fence_open
-  | doc_fence_close
+  | comment
+  | mapping_entry
+  | sequence_item
+  | literal_node
+  | fence_open
+  | fence_close
 }
 
 // ---------------------------------------------------------------------------
 // Top-level document
 // ---------------------------------------------------------------------------
 
-document = { SOI ~ block_line* ~ EOI }
+document = { SOI ~ statement* ~ EOI }

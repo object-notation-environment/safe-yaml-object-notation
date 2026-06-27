@@ -129,7 +129,7 @@ fn collect_lines(input: &str) -> Result<Vec<Line>, SyonError> {
 
     for pair in pairs.into_iter().next().unwrap().into_inner() {
         match pair.as_rule() {
-            Rule::comment_line => {
+            Rule::comment => {
                 let mut indent = 0usize;
                 let mut text = String::new();
                 for inner in pair.into_inner() {
@@ -142,7 +142,7 @@ fn collect_lines(input: &str) -> Result<Vec<Line>, SyonError> {
                 lines.push(Line::Comment { indent, text });
             }
 
-            Rule::key_value => {
+            Rule::mapping_entry => {
                 let mut indent = 0usize;
                 let mut key = String::new();
                 let mut value: Option<LineValue> = None;
@@ -154,7 +154,7 @@ fn collect_lines(input: &str) -> Result<Vec<Line>, SyonError> {
                         Rule::inline_value => {
                             value = Some(parse_inline_value(inner));
                         }
-                        Rule::inline_comment => {
+                        Rule::trailing_comment => {
                             trailing = Some(extract_comment_text(inner));
                         }
                         _ => {}
@@ -170,7 +170,7 @@ fn collect_lines(input: &str) -> Result<Vec<Line>, SyonError> {
                 lines.push(Line::KeyValue { indent, key, value, trailing });
             }
 
-            Rule::list_item => {
+            Rule::sequence_item => {
                 let mut indent = 0usize;
                 let mut value: Option<LineValue> = None;
                 let mut trailing: Option<String> = None;
@@ -180,7 +180,7 @@ fn collect_lines(input: &str) -> Result<Vec<Line>, SyonError> {
                         Rule::inline_value => {
                             value = Some(parse_inline_value(inner));
                         }
-                        Rule::inline_comment => {
+                        Rule::trailing_comment => {
                             trailing = Some(extract_comment_text(inner));
                         }
                         _ => {}
@@ -189,13 +189,13 @@ fn collect_lines(input: &str) -> Result<Vec<Line>, SyonError> {
                 lines.push(Line::ListItem { indent, value, trailing });
             }
 
-            Rule::literal_block => {
+            Rule::literal_node => {
                 // literal_block at top level (indent 0)
                 let content = extract_literal_content(pair);
                 lines.push(Line::LiteralBlock { indent: 0, content });
             }
 
-            Rule::doc_fence_open => {
+            Rule::fence_open => {
                 let mut path = String::new();
                 let mut format = String::new();
                 for inner in pair.into_inner() {
@@ -208,7 +208,7 @@ fn collect_lines(input: &str) -> Result<Vec<Line>, SyonError> {
                 lines.push(Line::FenceOpen { path, format });
             }
 
-            Rule::doc_fence_close => {
+            Rule::fence_close => {
                 lines.push(Line::FenceClose);
             }
 
@@ -223,7 +223,7 @@ fn collect_lines(input: &str) -> Result<Vec<Line>, SyonError> {
 fn parse_inline_value(pair: Pair<Rule>) -> LineValue {
     for inner in pair.into_inner() {
         match inner.as_rule() {
-            Rule::literal_block => {
+            Rule::literal_node => {
                 return LineValue::Literal(extract_literal_content(inner));
             }
             Rule::scalar_value => {
