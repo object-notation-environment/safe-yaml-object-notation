@@ -1,0 +1,13 @@
+[package]
+name = "syon-parser"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "syon_parser"
+path = "src/lib.rs"
+
+[dependencies]
+winnow = "0.6"
+
+[dev-dependencies]

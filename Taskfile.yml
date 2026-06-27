@@ -1,0 +1,52 @@
+version: '3'
+
+tasks:
+  build-parser-crate:
+    desc: Compile the syon-parser library crate
+    cmds:
+      - cargo build -p syon-parser
+
+  build-cli-binary:
+    desc: Compile the syon-cli binary crate
+    cmds:
+      - cargo build -p syon-cli
+
+  build-all-crates:
+    desc: Compile every crate in the workspace
+    cmds:
+      - cargo build --workspace
+
+  test-parser-crate:
+    desc: Run unit tests for syon-parser
+    cmds:
+      - cargo test -p syon-parser
+
+  test-all-crates:
+    desc: Run unit tests for every workspace crate
+    cmds:
+      - cargo test --workspace
+
+  run-cli-binary:
+    desc: Parse a .syon file and print the AST as JSON
+    cmds:
+      - cargo run -p syon-cli -- {{.CLI_ARGS}}
+
+  check-all-crates:
+    desc: Type-check the whole workspace without producing artifacts
+    cmds:
+      - cargo check --workspace
+
+  lint-all-crates:
+    desc: Run Clippy on the whole workspace
+    cmds:
+      - cargo clippy --workspace -- -D warnings
+
+  format-all-crates:
+    desc: Format every source file with rustfmt
+    cmds:
+      - cargo fmt --all
+
+  clean-build-artifacts:
+    desc: Remove all Cargo build artifacts
+    cmds:
+      - cargo clean
