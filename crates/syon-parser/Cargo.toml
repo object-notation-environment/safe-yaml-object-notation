@@ -6,7 +6,7 @@ edition = "2021"
 [lib]
 name = "syon_parser"
 path = "src/lib.rs"
-crate-type = ["lib", "cdylib"]
+crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 pest = "2"
