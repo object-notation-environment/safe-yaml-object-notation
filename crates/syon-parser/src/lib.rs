@@ -2,5 +2,5 @@ pub mod ast;
 pub mod lexer;
 pub mod parser;
 
-pub use ast::Value;
-pub use parser::parse;
+pub use ast::{Comment, Document, Mapping, MappingEntry, Sequence, Value};
+pub use parser::{parse_document, ParseError};
