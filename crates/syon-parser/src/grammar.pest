@@ -110,10 +110,10 @@ inline_value = { literal_block | scalar_value }
 // Key-value entry
 // ---------------------------------------------------------------------------
 
-colon_sp = _{ ":" ~ (SP | &NEWLINE | &EOI) }
+colon_operator = _{ ":" ~ (SP | &NEWLINE | &EOI) }
 
 key_value = {
-    indent ~ key_body ~ colon_sp ~
+    indent ~ key_body ~ colon_operator ~
     (inline_value ~ inline_comment? | inline_comment | &(NEWLINE | EOI)) ~
     (NEWLINE | EOI)
 }
@@ -122,10 +122,10 @@ key_value = {
 // Sequence item
 // ---------------------------------------------------------------------------
 
-dash_sp = _{ "-" ~ (SP | &NEWLINE | &EOI) }
+dash_operator = _{ "-" ~ (SP | &NEWLINE | &EOI) }
 
 list_item = {
-    indent ~ dash_sp ~
+    indent ~ dash_operator ~
     (inline_value ~ inline_comment? | inline_comment | &(NEWLINE | EOI)) ~
     (NEWLINE | EOI)
 }
