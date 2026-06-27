@@ -50,3 +50,18 @@ tasks:
     desc: Remove all Cargo build artifacts
     cmds:
       - cargo clean
+
+  build-python-bindings:
+    desc: Build and install the syon Python extension in development mode
+    cmds:
+      - maturin develop -m crates/syon-python/Cargo.toml
+
+  run-parser-tests:
+    desc: Run unit tests for the syon-parser crate
+    cmds:
+      - cargo test -p syon-parser
+
+  build-ffi-library:
+    desc: Build syon-parser cdylib and staticlib in release mode
+    cmds:
+      - cargo build -p syon-parser --release
