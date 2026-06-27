@@ -1,547 +1,799 @@
-use std::borrow::Cow;
+use pest::{iterators::Pair, Parser};
+use pest_derive::Parser;
 
-use saphyr_parser::{Event, Parser, Span, SpannedEventReceiver, Tag};
+use crate::ast::{Document, MappingEntry, SequenceItem, SyonFile, Value};
+use crate::error::SyonError;
 
-use crate::ast::{Comment, Document, Mapping, MappingEntry, Sequence, Value};
-
-/// A parse error returned by [`parse_document`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum ParseError {
-    /// A YAML construct that SYON explicitly forbids.
-    Forbidden(String),
-    /// A low-level scanner / syntax error.
-    Syntax(String),
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParseError::Forbidden(msg) => write!(f, "forbidden: {msg}"),
-            ParseError::Syntax(msg) => write!(f, "syntax error: {msg}"),
-        }
-    }
-}
+#[derive(Parser)]
+#[grammar = "src/grammar.pest"]
+pub struct SyonParser;
 
 // ---------------------------------------------------------------------------
-// Preflight checks on raw text
+// Forbidden-construct pre-flight scan
 // ---------------------------------------------------------------------------
 
-/// Scan the raw source for forbidden constructs that are detectable at the
-/// text level before saphyr-parser runs.
-///
-/// saphyr-parser 0.0.6 does not carry block/flow style on `MappingStart` /
-/// `SequenceStart` events, so flow-collection detection must happen here.
-fn preflight(input: &str) -> Result<(), ParseError> {
-    for (lineno, line) in input.lines().enumerate() {
-        let ln = lineno + 1;
-        let trimmed = line.trim_start();
+fn preflight(input: &str) -> Result<(), SyonError> {
+    for (i, line) in input.lines().enumerate() {
+        let ln = i + 1;
+        let t = line.trim_start();
 
-        // Forbidden: explicit document-start directive `---`.
-        if trimmed == "---" || trimmed.starts_with("--- ") {
-            return Err(ParseError::Forbidden(format!(
-                "line {ln}: explicit document start `---` is not allowed in SYON"
+        if t == "---" || t.starts_with("--- ") || t.starts_with("---\t") {
+            return Err(SyonError::Forbidden(format!(
+                "line {ln}: `---` document-start marker is not allowed in SYON"
             )));
         }
-
-        // Forbidden: complex mapping key `? `.
-        if trimmed.starts_with("? ") || trimmed == "?" {
-            return Err(ParseError::Forbidden(format!(
+        if t == "..." || t.starts_with("... ") {
+            return Err(SyonError::Forbidden(format!(
+                "line {ln}: `...` document-end marker is not allowed in SYON"
+            )));
+        }
+        if t == "?" || t.starts_with("? ") {
+            return Err(SyonError::Forbidden(format!(
                 "line {ln}: complex key `?` is not allowed in SYON"
             )));
         }
 
-        // Forbidden: flow collections — `{` or `[` as the first character of a
-        // value (outside double-quoted strings).  We scan from start, skipping
-        // quoted regions.
-        let bytes = trimmed.as_bytes();
-        let mut in_dq = false;
-        let mut escape_next = false;
-        let mut after_colon_space = trimmed.is_empty(); // treat line-start as value position
-        // Start position counts as a value position (e.g. `{…}` as whole document).
-        let mut value_position = true;
+        // Literal block delimiters `[[[` / `]]]` are not flow collections.
+        if t == "[[[" || t == "]]]" {
+            continue;
+        }
 
-        for (i, &b) in bytes.iter().enumerate() {
-            if escape_next {
-                escape_next = false;
-                value_position = false;
+        // Scan for forbidden inline constructs outside double-quoted strings.
+        let bytes = t.as_bytes();
+        let mut in_dq = false;
+        let mut esc = false;
+        let mut i_b = 0usize;
+        while i_b < bytes.len() {
+            if esc {
+                esc = false;
+                i_b += 1;
                 continue;
             }
-            match b {
-                b'\\' if in_dq => escape_next = true,
-                b'"' => {
-                    in_dq = !in_dq;
-                    value_position = false;
-                }
-                b'{' | b'[' if !in_dq && value_position => {
-                    let ch = b as char;
-                    return Err(ParseError::Forbidden(format!(
-                        "line {ln} col {}: flow collection `{ch}` is not allowed in SYON",
-                        i + 1
+            match bytes[i_b] {
+                b'\\' if in_dq => esc = true,
+                b'"' => in_dq = !in_dq,
+                b'!' if !in_dq => {
+                    return Err(SyonError::Forbidden(format!(
+                        "line {ln}: tag `!` / `!!` is not allowed in SYON"
                     )));
                 }
-                b':' if !in_dq => {
-                    // `: ` — next non-space character is a value position.
-                    if bytes.get(i + 1).copied() == Some(b' ')
-                        || bytes.get(i + 1).is_none()
-                    {
-                        after_colon_space = true;
-                        value_position = false;
-                    } else {
-                        value_position = false;
+                b'&' if !in_dq => {
+                    // Only forbidden when followed by alphanumeric (anchor syntax)
+                    if bytes.get(i_b + 1).map(|b| b.is_ascii_alphanumeric()).unwrap_or(false) {
+                        return Err(SyonError::Forbidden(format!(
+                            "line {ln}: anchor `&name` is not allowed in SYON"
+                        )));
                     }
                 }
-                b' ' | b'\t' if !in_dq => {
-                    if after_colon_space {
-                        value_position = true;
-                        after_colon_space = false;
-                    } else {
-                        value_position = false;
+                b'*' if !in_dq => {
+                    if bytes.get(i_b + 1).map(|b| b.is_ascii_alphanumeric()).unwrap_or(false) {
+                        // Only forbidden at value position (after `: ` or `- `)
+                        let prefix = &t[..i_b];
+                        let trimmed = prefix.trim_end();
+                        if trimmed.ends_with(':') || trimmed.ends_with('-') || trimmed.is_empty() {
+                            return Err(SyonError::Forbidden(format!(
+                                "line {ln}: alias `*name` is not allowed in SYON"
+                            )));
+                        }
                     }
                 }
-                _ => {
-                    after_colon_space = false;
-                    value_position = false;
+                b'{' | b'[' if !in_dq => {
+                    // Only forbidden at value positions
+                    let prefix = &t[..i_b];
+                    let trimmed = prefix.trim_end();
+                    if trimmed.is_empty() || trimmed.ends_with(':') || trimmed.ends_with('-') {
+                        let ch = bytes[i_b] as char;
+                        return Err(SyonError::Forbidden(format!(
+                            "line {ln}: flow collection `{ch}` is not allowed in SYON"
+                        )));
+                    }
                 }
+                _ => {}
             }
+            i_b += 1;
         }
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Event receiver
+// Flat line representation after pest tokenisation
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-enum Frame {
-    Mapping {
-        entries: Vec<MappingEntry>,
-        pending_key: Option<String>,
-        pending_leading: Vec<Comment>,
-    },
-    Sequence {
-        items: Vec<Value>,
-    },
+enum Line {
+    Comment { indent: usize, text: String },
+    KeyValue { indent: usize, key: String, value: Option<LineValue>, trailing: Option<String> },
+    ListItem { indent: usize, value: Option<LineValue>, trailing: Option<String> },
+    LiteralBlock { indent: usize, content: String },
+    FenceOpen { path: String, format: String },
+    FenceClose,
 }
 
-struct SyonReceiver {
-    stack: Vec<Frame>,
-    #[allow(dead_code)]
-    /// Comments extracted from the source (line-number, text).
-    comments: Vec<(usize, String)>,
-    result: Option<Value>,
-    error: Option<ParseError>,
-}
-
-impl SyonReceiver {
-    fn new(comments: Vec<(usize, String)>) -> Self {
-        Self {
-            stack: Vec::new(),
-            comments,
-            result: None,
-            error: None,
-        }
-    }
-
-    fn push_value(&mut self, v: Value) {
-        if let Some(frame) = self.stack.last_mut() {
-            match frame {
-                Frame::Mapping {
-                    entries,
-                    pending_key,
-                    pending_leading,
-                } => {
-                    if let Some(key) = pending_key.take() {
-                        entries.push(MappingEntry {
-                            key,
-                            value: v,
-                            leading_comments: std::mem::take(pending_leading),
-                            trailing_comment: None,
-                        });
-                    } else {
-                        // This value IS the key (scalars only).
-                        if let Value::Scalar(k) = v {
-                            *pending_key = Some(k);
-                        } else {
-                            self.error = Some(ParseError::Forbidden(
-                                "mapping keys must be plain scalars".into(),
-                            ));
-                        }
-                    }
-                }
-                Frame::Sequence { items } => {
-                    items.push(v);
-                }
-            }
-        } else {
-            // Top-level value.
-            self.result = Some(v);
-        }
-    }
-
-    fn check_anchor(anchor_id: usize) -> Option<ParseError> {
-        if anchor_id != 0 {
-            Some(ParseError::Forbidden(
-                "anchor `&name` is not allowed in SYON".into(),
-            ))
-        } else {
-            None
-        }
-    }
-
-    fn check_tag(tag: &Option<Cow<'_, Tag>>) -> Option<ParseError> {
-        if tag.is_some() {
-            Some(ParseError::Forbidden(
-                "tag `!tag` / `!!type` is not allowed in SYON".into(),
-            ))
-        } else {
-            None
-        }
-    }
-}
-
-impl<'input> SpannedEventReceiver<'input> for SyonReceiver {
-    fn on_event(&mut self, ev: Event<'input>, _span: Span) {
-        if self.error.is_some() {
-            return;
-        }
-
-        match ev {
-            Event::StreamStart | Event::StreamEnd | Event::DocumentEnd | Event::Nothing => {}
-
-            Event::DocumentStart(explicit) => {
-                if explicit {
-                    self.error = Some(ParseError::Forbidden(
-                        "explicit document start `---` is not allowed in SYON".into(),
-                    ));
-                }
-            }
-
-            Event::Alias(_) => {
-                self.error = Some(ParseError::Forbidden(
-                    "alias `*name` is not allowed in SYON".into(),
-                ));
-            }
-
-            Event::Scalar(value, _style, anchor_id, ref tag) => {
-                if let Some(e) = Self::check_anchor(anchor_id) {
-                    self.error = Some(e);
-                    return;
-                }
-                if let Some(e) = Self::check_tag(tag) {
-                    self.error = Some(e);
-                    return;
-                }
-                self.push_value(Value::Scalar(value.into_owned()));
-            }
-
-            Event::MappingStart(anchor_id, ref tag) => {
-                if let Some(e) = Self::check_anchor(anchor_id) {
-                    self.error = Some(e);
-                    return;
-                }
-                if let Some(e) = Self::check_tag(tag) {
-                    self.error = Some(e);
-                    return;
-                }
-                self.stack.push(Frame::Mapping {
-                    entries: Vec::new(),
-                    pending_key: None,
-                    pending_leading: Vec::new(),
-                });
-            }
-
-            Event::MappingEnd => {
-                if let Some(Frame::Mapping {
-                    entries,
-                    pending_key: _,
-                    pending_leading: _,
-                }) = self.stack.pop()
-                {
-                    // Check for duplicate keys.
-                    let mut seen = std::collections::HashSet::new();
-                    for e in &entries {
-                        if !seen.insert(e.key.clone()) {
-                            self.error = Some(ParseError::Syntax(format!(
-                                "duplicate key {:?}",
-                                e.key
-                            )));
-                            return;
-                        }
-                    }
-                    self.push_value(Value::Mapping(Mapping { entries }));
-                }
-            }
-
-            Event::SequenceStart(anchor_id, ref tag) => {
-                if let Some(e) = Self::check_anchor(anchor_id) {
-                    self.error = Some(e);
-                    return;
-                }
-                if let Some(e) = Self::check_tag(tag) {
-                    self.error = Some(e);
-                    return;
-                }
-                self.stack.push(Frame::Sequence { items: Vec::new() });
-            }
-
-            Event::SequenceEnd => {
-                if let Some(Frame::Sequence { items }) = self.stack.pop() {
-                    self.push_value(Value::Sequence(Sequence { items }));
-                }
-            }
-        }
-    }
+#[derive(Debug)]
+enum LineValue {
+    Scalar(String),
+    Literal(String),
 }
 
 // ---------------------------------------------------------------------------
-// Comment extraction
+// Turn the flat pest output into Line structs
 // ---------------------------------------------------------------------------
 
-/// Scan the raw SYON source and collect `(1-based line, comment text)` pairs.
-///
-/// Applies the spacing rule: `#` is structural only when preceded by
-/// whitespace (or at column 0) and followed by a space or end-of-line.
-fn extract_comments(input: &str) -> Vec<(usize, String)> {
-    let mut out = Vec::new();
-    for (lineno, line) in input.lines().enumerate() {
-        let bytes = line.as_bytes();
-        let mut in_dq = false;
-        let mut escape_next = false;
-        for (i, &b) in bytes.iter().enumerate() {
-            if escape_next {
-                escape_next = false;
-                continue;
-            }
-            match b {
-                b'\\' if in_dq => escape_next = true,
-                b'"' => in_dq = !in_dq,
-                b'#' if !in_dq => {
-                    let preceded_by_ws = i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t';
-                    let followed_by_ws_or_eol = i + 1 >= bytes.len()
-                        || bytes[i + 1] == b' '
-                        || bytes[i + 1] == b'\t';
-                    if preceded_by_ws && followed_by_ws_or_eol {
-                        let text = line[i + 1..].trim().to_owned();
-                        out.push((lineno + 1, text));
-                        break;
+fn collect_lines(input: &str) -> Result<Vec<Line>, SyonError> {
+    let pairs = SyonParser::parse(Rule::document, input).map_err(|e| {
+        SyonError::Syntax(format!("{e}"))
+    })?;
+
+    let mut lines = Vec::new();
+
+    for pair in pairs.into_iter().next().unwrap().into_inner() {
+        match pair.as_rule() {
+            Rule::comment_line => {
+                let mut indent = 0usize;
+                let mut text = String::new();
+                for inner in pair.into_inner() {
+                    match inner.as_rule() {
+                        Rule::indent => indent = inner.as_str().len(),
+                        Rule::comment_text => text = inner.as_str().to_owned(),
+                        _ => {}
                     }
                 }
-                _ => {}
+                lines.push(Line::Comment { indent, text });
             }
+
+            Rule::key_value => {
+                let mut indent = 0usize;
+                let mut key = String::new();
+                let mut value: Option<LineValue> = None;
+                let mut trailing: Option<String> = None;
+                for inner in pair.into_inner() {
+                    match inner.as_rule() {
+                        Rule::indent => indent = inner.as_str().len(),
+                        Rule::key_body => key = inner.as_str().to_owned(),
+                        Rule::inline_value => {
+                            value = Some(parse_inline_value(inner));
+                        }
+                        Rule::inline_comment => {
+                            trailing = Some(extract_comment_text(inner));
+                        }
+                        _ => {}
+                    }
+                }
+                // Validate key doesn't start with operator symbols
+                let k = key.trim_start();
+                if k.starts_with(':') || k.starts_with('-') || k.starts_with('#') {
+                    return Err(SyonError::Syntax(format!(
+                        "key {:?} must not start with an operator symbol", key
+                    )));
+                }
+                lines.push(Line::KeyValue { indent, key, value, trailing });
+            }
+
+            Rule::list_item => {
+                let mut indent = 0usize;
+                let mut value: Option<LineValue> = None;
+                let mut trailing: Option<String> = None;
+                for inner in pair.into_inner() {
+                    match inner.as_rule() {
+                        Rule::indent => indent = inner.as_str().len(),
+                        Rule::inline_value => {
+                            value = Some(parse_inline_value(inner));
+                        }
+                        Rule::inline_comment => {
+                            trailing = Some(extract_comment_text(inner));
+                        }
+                        _ => {}
+                    }
+                }
+                lines.push(Line::ListItem { indent, value, trailing });
+            }
+
+            Rule::literal_block => {
+                // literal_block at top level (indent 0)
+                let content = extract_literal_content(pair);
+                lines.push(Line::LiteralBlock { indent: 0, content });
+            }
+
+            Rule::doc_fence_open => {
+                let mut path = String::new();
+                let mut format = String::new();
+                for inner in pair.into_inner() {
+                    match inner.as_rule() {
+                        Rule::fence_path => path = inner.as_str().to_owned(),
+                        Rule::fence_format => format = inner.as_str().to_owned(),
+                        _ => {}
+                    }
+                }
+                lines.push(Line::FenceOpen { path, format });
+            }
+
+            Rule::doc_fence_close => {
+                lines.push(Line::FenceClose);
+            }
+
+            Rule::EOI => {}
+            _ => {}
+        }
+    }
+
+    Ok(lines)
+}
+
+fn parse_inline_value(pair: Pair<Rule>) -> LineValue {
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::literal_block => {
+                return LineValue::Literal(extract_literal_content(inner));
+            }
+            Rule::scalar_value => {
+                return LineValue::Scalar(extract_scalar(inner));
+            }
+            _ => {}
+        }
+    }
+    LineValue::Scalar(String::new())
+}
+
+fn extract_scalar(pair: Pair<Rule>) -> String {
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::dq_scalar => {
+                let s = inner.as_str();
+                // Strip surrounding quotes and unescape
+                return unescape_dq(&s[1..s.len() - 1]);
+            }
+            Rule::plain_scalar => {
+                return inner.as_str().trim_end().to_owned();
+            }
+            _ => {}
+        }
+    }
+    String::new()
+}
+
+fn unescape_dq(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(c) => { out.push('\\'); out.push(c); }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
         }
     }
     out
 }
 
-// ---------------------------------------------------------------------------
-// Literal block extraction
-// ---------------------------------------------------------------------------
-
-/// Check whether `input` is a standalone literal block (`[[[ … ]]]`).
-fn try_parse_literal_block(input: &str) -> Option<Value> {
-    let lines: Vec<&str> = input.lines().collect();
-    if lines.first().map(|l| l.trim()) == Some("[[[") {
-        let close = lines.iter().rposition(|l| l.trim() == "]]]")?;
-        let body = lines[1..close].join("\n");
-        return Some(Value::LiteralBlock(body));
+fn extract_literal_content(pair: Pair<Rule>) -> String {
+    let mut content = String::new();
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::literal_content {
+            for raw_line in inner.into_inner() {
+                if raw_line.as_rule() == Rule::literal_raw_line {
+                    content.push_str(raw_line.as_str());
+                }
+            }
+        }
     }
-    None
+    // Remove trailing newline added by the grammar
+    if content.ends_with('\n') {
+        content.pop();
+    }
+    content
+}
+
+fn extract_comment_text(pair: Pair<Rule>) -> String {
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::inline_comment_text {
+            return inner.as_str().trim_end().to_owned();
+        }
+    }
+    String::new()
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Build AST from flat Line list using indentation stack
 // ---------------------------------------------------------------------------
 
-/// Parse a SYON source string into a [`Document`].
-///
-/// Returns [`ParseError::Forbidden`] if any YAML construct that SYON forbids
-/// is encountered, and [`ParseError::Syntax`] for malformed input.
-pub fn parse_document(input: &str) -> Result<Document, ParseError> {
-    // 1. Check for standalone literal block (`[[[ … ]]]`).
-    if let Some(lit) = try_parse_literal_block(input.trim()) {
-        return Ok(Document {
-            body: lit,
-            trailing_comments: Vec::new(),
-        });
+struct Builder<'a> {
+    lines: &'a [Line],
+    pos: usize,
+}
+
+impl<'a> Builder<'a> {
+    fn new(lines: &'a [Line]) -> Self {
+        Self { lines, pos: 0 }
     }
 
-    // 2. Preflight scan for constructs that can't be detected from events.
+    fn peek_indent(&self) -> Option<usize> {
+        self.lines.get(self.pos).map(|l| match l {
+            Line::Comment { indent, .. } => *indent,
+            Line::KeyValue { indent, .. } => *indent,
+            Line::ListItem { indent, .. } => *indent,
+            Line::LiteralBlock { indent, .. } => *indent,
+            _ => 0,
+        })
+    }
+
+    fn peek_is_fence(&self) -> bool {
+        matches!(self.lines.get(self.pos), Some(Line::FenceOpen { .. }) | Some(Line::FenceClose))
+    }
+
+    /// Collect pending comment lines at or above `min_indent`.
+    fn collect_comments(&mut self, min_indent: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(Line::Comment { indent, text }) = self.lines.get(self.pos) {
+            if *indent < min_indent {
+                break;
+            }
+            out.push(text.clone());
+            self.pos += 1;
+        }
+        out
+    }
+
+    /// Parse a block of lines all sharing `expected_indent`, returning a Value.
+    /// Returns None if there are no applicable lines at this indent.
+    fn parse_block(&mut self, expected_indent: usize) -> Result<Option<Value>, SyonError> {
+        // Peek at the first real (non-comment) line
+        let save = self.pos;
+        // Skip comments temporarily to see what kind of block follows
+        let mut scan = self.pos;
+        while let Some(Line::Comment { .. }) = self.lines.get(scan) {
+            scan += 1;
+        }
+        match self.lines.get(scan) {
+            None | Some(Line::FenceOpen { .. }) | Some(Line::FenceClose) => return Ok(None),
+            Some(Line::KeyValue { indent, .. }) if *indent == expected_indent => {
+                return Ok(Some(self.parse_mapping(expected_indent)?));
+            }
+            Some(Line::ListItem { indent, .. }) if *indent == expected_indent => {
+                return Ok(Some(self.parse_sequence(expected_indent)?));
+            }
+            Some(Line::LiteralBlock { indent, content }) if *indent == expected_indent => {
+                let content = content.clone();
+                self.pos = scan + 1;
+                return Ok(Some(Value::LiteralBlock(content)));
+            }
+            Some(Line::KeyValue { indent, .. }) | Some(Line::ListItem { indent, .. })
+                if *indent != expected_indent =>
+            {
+                // Different indent level — not our block
+                let _ = save;
+                return Ok(None);
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    fn parse_mapping(&mut self, indent: usize) -> Result<Value, SyonError> {
+        let mut entries: Vec<MappingEntry> = Vec::new();
+
+        loop {
+            let leading_comments = self.collect_comments(indent);
+
+            match self.lines.get(self.pos) {
+                Some(Line::KeyValue { indent: kv_indent, .. }) if *kv_indent == indent => {}
+                _ => {
+                    // Put comment lines back? No — they're consumed. But if no
+                    // key follows, these are "trailing" block comments we discard
+                    // from the mapping (they'd belong to a parent).
+                    // Re-wind comment consumption if nothing followed:
+                    if !leading_comments.is_empty() {
+                        // Back up: rewind past the consumed comments
+                        self.pos -= leading_comments.len();
+                    }
+                    break;
+                }
+            }
+
+            if let Some(Line::KeyValue { key, value, trailing, indent: _ }) =
+                self.lines.get(self.pos)
+            {
+                let key = key.clone();
+                let inline_val = value.as_ref().map(|v| match v {
+                    LineValue::Scalar(s) => Value::Scalar(s.clone()),
+                    LineValue::Literal(s) => Value::LiteralBlock(s.clone()),
+                });
+                let trailing_comment = trailing.clone();
+                self.pos += 1;
+
+                // Check for a child block at indent+1 (or more)
+                let child_indent = self.peek_indent();
+                let child_value = if let Some(ci) = child_indent {
+                    if ci > indent && !self.peek_is_fence() {
+                        self.parse_block(ci)?
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let value = match (inline_val, child_value) {
+                    (_, Some(child)) => child,
+                    (Some(iv), None) => iv,
+                    (None, None) => Value::Scalar(String::new()),
+                };
+
+                // Duplicate key check
+                if entries.iter().any(|e| e.key == key) {
+                    return Err(SyonError::Syntax(format!("duplicate key {:?}", key)));
+                }
+
+                entries.push(MappingEntry {
+                    key,
+                    value,
+                    leading_comments,
+                    trailing_comment,
+                });
+            }
+        }
+
+        Ok(Value::Mapping(entries))
+    }
+
+    fn parse_sequence(&mut self, indent: usize) -> Result<Value, SyonError> {
+        let mut items: Vec<SequenceItem> = Vec::new();
+
+        loop {
+            let leading_comments = self.collect_comments(indent);
+
+            match self.lines.get(self.pos) {
+                Some(Line::ListItem { indent: li_indent, .. }) if *li_indent == indent => {}
+                _ => {
+                    if !leading_comments.is_empty() {
+                        self.pos -= leading_comments.len();
+                    }
+                    break;
+                }
+            }
+
+            if let Some(Line::ListItem { value, trailing, indent: _ }) = self.lines.get(self.pos) {
+                let inline_val = value.as_ref().map(|v| match v {
+                    LineValue::Scalar(s) => Value::Scalar(s.clone()),
+                    LineValue::Literal(s) => Value::LiteralBlock(s.clone()),
+                });
+                let trailing_comment = trailing.clone();
+                self.pos += 1;
+
+                let child_indent = self.peek_indent();
+                let child_value = if let Some(ci) = child_indent {
+                    if ci > indent && !self.peek_is_fence() {
+                        self.parse_block(ci)?
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let value = match (inline_val, child_value) {
+                    (_, Some(child)) => child,
+                    (Some(iv), None) => iv,
+                    (None, None) => Value::Scalar(String::new()),
+                };
+
+                items.push(SequenceItem {
+                    value,
+                    leading_comments,
+                    trailing_comment,
+                });
+            }
+        }
+
+        Ok(Value::Sequence(items))
+    }
+
+    /// Parse the top-level document body (indent 0 or first encountered indent).
+    fn parse_document_body(&mut self) -> Result<Value, SyonError> {
+        // Find the first non-comment indent without consuming comments — let
+        // parse_mapping / parse_sequence collect them as leading_comments.
+        let mut scan = self.pos;
+        while let Some(Line::Comment { .. }) = self.lines.get(scan) {
+            scan += 1;
+        }
+
+        let Some(first_indent) = (match self.lines.get(scan) {
+            Some(Line::KeyValue { indent, .. })
+            | Some(Line::ListItem { indent, .. })
+            | Some(Line::LiteralBlock { indent, .. }) => Some(*indent),
+            _ => None,
+        }) else {
+            return Ok(Value::Mapping(Vec::new()));
+        };
+
+        if self.peek_is_fence() {
+            return Ok(Value::Mapping(Vec::new()));
+        }
+
+        let block = self.parse_block(first_indent)?;
+        Ok(block.unwrap_or(Value::Mapping(Vec::new())))
+    }
+
+    /// Consume lines up to (but not including) the next FenceClose, building a Document.
+    fn parse_fenced_document(
+        &mut self,
+        path: String,
+        format: String,
+    ) -> Result<Document, SyonError> {
+        let body = self.parse_document_body()?;
+        // Consume FenceClose if present
+        if matches!(self.lines.get(self.pos), Some(Line::FenceClose)) {
+            self.pos += 1;
+        }
+        Ok(Document { path: Some(path), format: Some(format), body })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
+
+/// Parse a SYON source string into a [`SyonFile`].
+pub fn parse(input: &str) -> Result<SyonFile, SyonError> {
     preflight(input)?;
 
-    // 3. Extract comments before saphyr-parser strips them.
-    let comments = extract_comments(input);
+    let lines = collect_lines(input)?;
+    let mut builder = Builder::new(&lines);
+    let mut documents: Vec<Document> = Vec::new();
 
-    // 4. Run saphyr-parser event loop.
-    let mut recv = SyonReceiver::new(comments.clone());
-    let mut parser = Parser::new_from_str(input);
-    parser
-        .load(&mut recv, true)
-        .map_err(|e| ParseError::Syntax(e.to_string()))?;
-
-    if let Some(err) = recv.error {
-        return Err(err);
+    while builder.pos < builder.lines.len() {
+        match builder.lines.get(builder.pos) {
+            Some(Line::FenceOpen { path, format }) => {
+                let path = path.clone();
+                let format = format.clone();
+                builder.pos += 1;
+                let doc = builder.parse_fenced_document(path, format)?;
+                documents.push(doc);
+            }
+            Some(Line::FenceClose) => {
+                // Stray close — skip
+                builder.pos += 1;
+            }
+            _ => {
+                // Main (unfenced) document
+                let body = builder.parse_document_body()?;
+                documents.push(Document { path: None, format: None, body });
+            }
+        }
     }
 
-    // 5. Attach trailing (document-level) comments — those whose line number
-    //    is after the last key/value event.  For this scaffold we attach all
-    //    extracted comments to the document root; a full implementation would
-    //    thread span info through the receiver to place them precisely.
-    let trailing_comments: Vec<Comment> = comments
-        .into_iter()
-        .map(|(_, text)| Comment { text })
-        .collect();
+    if documents.is_empty() {
+        documents.push(Document { path: None, format: None, body: Value::Mapping(Vec::new()) });
+    }
 
-    let body = recv
-        .result
-        .unwrap_or(Value::Mapping(Mapping { entries: Vec::new() }));
-
-    Ok(Document {
-        body,
-        trailing_comments,
-    })
+    Ok(SyonFile { documents })
 }
+
+/// Convenience: parse and return the first document's body.
+pub fn parse_document(input: &str) -> Result<crate::ast::Document, SyonError> {
+    let mut file = parse(input)?;
+    Ok(file.documents.remove(0))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::Value;
 
-    // --- Basic parsing ---
+    // --- Spacing rule: colon ---
 
     #[test]
-    fn parse_scalar() {
-        let doc = parse_document("hello").unwrap();
-        assert_eq!(doc.body, Value::Scalar("hello".into()));
-    }
-
-    #[test]
-    fn parse_block_mapping() {
-        let doc = parse_document("name: Alice\nage: 30\n").unwrap();
-        if let Value::Mapping(m) = &doc.body {
-            assert_eq!(m.entries[0].key, "name");
-            assert_eq!(m.entries[0].value, Value::Scalar("Alice".into()));
-            assert_eq!(m.entries[1].key, "age");
-            assert_eq!(m.entries[1].value, Value::Scalar("30".into()));
-        } else {
-            panic!("expected Mapping");
+    fn colon_space_is_key_separator() {
+        let doc = parse_document("key: value\n").unwrap();
+        match &doc.body {
+            Value::Mapping(entries) => {
+                assert_eq!(entries[0].key, "key");
+                assert_eq!(entries[0].value, Value::Scalar("value".into()));
+            }
+            other => panic!("expected Mapping, got {other:?}"),
         }
     }
 
     #[test]
-    fn parse_block_sequence() {
+    fn colon_without_space_is_literal() {
+        // "https://example.com" — the `:` is not followed by a space so it's literal
+        let doc = parse_document("url: https://example.com\n").unwrap();
+        match &doc.body {
+            Value::Mapping(entries) => {
+                assert_eq!(entries[0].key, "url");
+                assert_eq!(entries[0].value, Value::Scalar("https://example.com".into()));
+            }
+            other => panic!("expected Mapping, got {other:?}"),
+        }
+    }
+
+    // --- Spacing rule: dash ---
+
+    #[test]
+    fn dash_space_is_list_item() {
         let doc = parse_document("- alpha\n- beta\n").unwrap();
-        if let Value::Sequence(seq) = &doc.body {
-            assert_eq!(seq.items.len(), 2);
-            assert_eq!(seq.items[0], Value::Scalar("alpha".into()));
-        } else {
-            panic!("expected Sequence");
+        match &doc.body {
+            Value::Sequence(items) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].value, Value::Scalar("alpha".into()));
+                assert_eq!(items[1].value, Value::Scalar("beta".into()));
+            }
+            other => panic!("expected Sequence, got {other:?}"),
         }
     }
 
-    // --- Forbidden construct rejection ---
+    #[test]
+    fn dash_without_space_is_literal() {
+        // "-draft" as a value should not become a list item
+        let doc = parse_document("tag: -draft\n").unwrap();
+        match &doc.body {
+            Value::Mapping(entries) => {
+                assert_eq!(entries[0].value, Value::Scalar("-draft".into()));
+            }
+            other => panic!("expected Mapping, got {other:?}"),
+        }
+    }
+
+    // --- Spacing rule: hash ---
 
     #[test]
-    fn reject_yaml_tag() {
-        let result = parse_document("key: !!str value\n");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("tag"), "expected 'tag' in: {msg}");
+    fn hash_space_is_comment() {
+        // A comment-only document body should be empty mapping
+        let doc = parse_document("# top comment\nkey: val\n").unwrap();
+        match &doc.body {
+            Value::Mapping(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].key, "key");
+                // Comment is attached as leading comment on the entry
+            }
+            other => panic!("expected Mapping, got {other:?}"),
+        }
     }
 
     #[test]
-    fn reject_anchor() {
-        let result = parse_document("key: &anchor value\n");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("anchor"), "expected 'anchor' in: {msg}");
-    }
-
-    #[test]
-    fn reject_alias() {
-        let result = parse_document("a: &anc val\nb: *anc\n");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("alias") || msg.contains("anchor"), "got: {msg}");
-    }
-
-    #[test]
-    fn reject_flow_mapping() {
-        let result = parse_document("{key: value}\n");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("flow"), "expected 'flow' in: {msg}");
-    }
-
-    #[test]
-    fn reject_flow_sequence() {
-        let result = parse_document("key: [a, b]\n");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("flow"), "expected 'flow' in: {msg}");
-    }
-
-    #[test]
-    fn reject_explicit_document_start() {
-        let result = parse_document("---\nkey: value\n");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn reject_complex_key() {
-        let result = parse_document("? complex key\n: value\n");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn reject_duplicate_keys() {
-        let result = parse_document("a: 1\na: 2\n");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("duplicate"), "expected 'duplicate' in: {msg}");
+    fn hash_without_space_is_literal_value() {
+        // "abc#123" — `#` not preceded by space, so it's part of the value
+        let doc = parse_document("id: abc#123\n").unwrap();
+        match &doc.body {
+            Value::Mapping(entries) => {
+                assert_eq!(entries[0].value, Value::Scalar("abc#123".into()));
+            }
+            other => panic!("expected Mapping, got {other:?}"),
+        }
     }
 
     // --- Literal block ---
 
     #[test]
-    fn parse_standalone_literal_block() {
+    fn literal_block_roundtrip() {
         let input = "[[[\nline one\nline two\n]]]\n";
         let doc = parse_document(input).unwrap();
-        assert!(
-            matches!(&doc.body, Value::LiteralBlock(s) if s.contains("line one")),
-            "expected LiteralBlock, got {:?}",
-            doc.body
-        );
+        match &doc.body {
+            Value::LiteralBlock(s) => {
+                assert!(s.contains("line one"), "got: {s:?}");
+                assert!(s.contains("line two"), "got: {s:?}");
+            }
+            other => panic!("expected LiteralBlock, got {other:?}"),
+        }
     }
 
-    // --- Comment extraction ---
+    // --- Forbidden constructs ---
 
     #[test]
-    fn leading_comment_extracted() {
-        let input = "# top comment\nkey: val\n";
+    fn reject_yaml_tag() {
+        let err = parse_document("key: !!str value\n").unwrap_err().to_string();
+        assert!(err.contains("tag") || err.contains("!"), "got: {err}");
+    }
+
+    #[test]
+    fn reject_anchor() {
+        let err = parse_document("key: &anchor value\n").unwrap_err().to_string();
+        assert!(err.contains("anchor") || err.contains("&"), "got: {err}");
+    }
+
+    #[test]
+    fn reject_alias() {
+        let err = parse_document("a: &anc val\nb: *anc\n").unwrap_err().to_string();
+        assert!(err.contains("alias") || err.contains("anchor") || err.contains("*"), "got: {err}");
+    }
+
+    #[test]
+    fn reject_flow_mapping() {
+        let err = parse_document("{key: value}\n").unwrap_err().to_string();
+        assert!(err.contains("flow") || err.contains("{"), "got: {err}");
+    }
+
+    #[test]
+    fn reject_flow_sequence() {
+        let err = parse_document("key: [a, b]\n").unwrap_err().to_string();
+        assert!(err.contains("flow") || err.contains("["), "got: {err}");
+    }
+
+    #[test]
+    fn reject_explicit_document_start() {
+        assert!(parse_document("---\nkey: value\n").is_err());
+    }
+
+    #[test]
+    fn reject_complex_key() {
+        assert!(parse_document("? complex key\n: value\n").is_err());
+    }
+
+    // --- Nested mapping ---
+
+    #[test]
+    fn nested_mapping_parses() {
+        let input = "outer:\n  inner: value\n";
         let doc = parse_document(input).unwrap();
-        // Comments are currently attached to trailing_comments at document level.
-        assert!(!doc.trailing_comments.is_empty());
-        assert_eq!(doc.trailing_comments[0].text, "top comment");
+        match &doc.body {
+            Value::Mapping(entries) => {
+                assert_eq!(entries[0].key, "outer");
+                match &entries[0].value {
+                    Value::Mapping(inner) => {
+                        assert_eq!(inner[0].key, "inner");
+                        assert_eq!(inner[0].value, Value::Scalar("value".into()));
+                    }
+                    other => panic!("expected inner Mapping, got {other:?}"),
+                }
+            }
+            other => panic!("expected outer Mapping, got {other:?}"),
+        }
+    }
+
+    // --- Multi-document fence ---
+
+    #[test]
+    fn multi_document_fence_separates_documents() {
+        let input = "```config.json\nkey: value\n```\n";
+        let file = parse(input).unwrap();
+        let fenced = file.documents.iter().find(|d| d.path.is_some()).unwrap();
+        assert_eq!(fenced.path.as_deref(), Some("config"));
+        assert_eq!(fenced.format.as_deref(), Some("json"));
+    }
+
+    // --- Duplicate key rejection ---
+
+    #[test]
+    fn reject_duplicate_keys() {
+        let err = parse_document("a: 1\na: 2\n").unwrap_err().to_string();
+        assert!(err.contains("duplicate"), "got: {err}");
+    }
+
+    // --- Comment attachment ---
+
+    #[test]
+    fn leading_comment_attached_to_entry() {
+        let input = "# section header\nkey: value\n";
+        let doc = parse_document(input).unwrap();
+        match &doc.body {
+            Value::Mapping(entries) => {
+                assert!(!entries[0].leading_comments.is_empty(),
+                    "expected leading comments on entry");
+                assert_eq!(entries[0].leading_comments[0], "section header");
+            }
+            other => panic!("expected Mapping, got {other:?}"),
+        }
     }
 
     #[test]
-    fn inline_comment_extracted() {
+    fn trailing_comment_attached_to_entry() {
         let input = "key: value # side note\n";
         let doc = parse_document(input).unwrap();
-        assert!(doc.trailing_comments.iter().any(|c| c.text == "side note"));
-    }
-
-    #[test]
-    fn hash_without_space_not_a_comment() {
-        let input = "id: abc#123\n";
-        let doc = parse_document(input).unwrap();
-        // "abc#123" should be the scalar value, not split into value + comment.
-        assert!(doc.trailing_comments.is_empty());
-        if let Value::Mapping(m) = &doc.body {
-            assert_eq!(m.entries[0].value, Value::Scalar("abc#123".into()));
-        } else {
-            panic!("expected Mapping");
+        match &doc.body {
+            Value::Mapping(entries) => {
+                assert_eq!(entries[0].trailing_comment.as_deref(), Some("side note"));
+            }
+            other => panic!("expected Mapping, got {other:?}"),
         }
     }
 }

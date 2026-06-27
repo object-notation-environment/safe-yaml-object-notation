@@ -1,0 +1,13 @@
+[package]
+name = "syon-python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "syon_python"
+crate-type = ["cdylib"]
+
+[dependencies]
+syon-parser = { path = "../syon-parser" }
+pyo3 = { version = "0.21", features = ["extension-module"] }
+serde_json = "1"

@@ -2,5 +2,6 @@
 resolver = "2"
 members = [
     "crates/syon-parser",
+    "crates/syon-python",
     "crates/syon-cli",
 ]

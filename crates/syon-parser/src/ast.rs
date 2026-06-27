@@ -1,46 +1,38 @@
-/// A comment node — first-class in the SYON AST.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Comment {
-    pub text: String,
-}
+use serde::{Deserialize, Serialize};
 
-/// A key–value pair inside a mapping.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MappingEntry {
-    pub key: String,
-    pub value: Value,
-    /// Comment lines that appear immediately before this key on their own line.
-    pub leading_comments: Vec<Comment>,
-    /// A `# …` comment on the same line as the key or value.
-    pub trailing_comment: Option<Comment>,
-}
-
-/// A SYON mapping (ordered).
-#[derive(Debug, Clone, PartialEq)]
-pub struct Mapping {
-    pub entries: Vec<MappingEntry>,
-}
-
-/// A SYON sequence.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Sequence {
-    pub items: Vec<Value>,
-}
-
-/// A SYON value node.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
-    Mapping(Mapping),
-    Sequence(Sequence),
-    /// All scalars are strings at the parse boundary — no implicit typing.
     Scalar(String),
-    /// Verbatim content from a `[[[` … `]]]` literal-block escape hatch.
+    Mapping(Vec<MappingEntry>),
+    Sequence(Vec<SequenceItem>),
     LiteralBlock(String),
 }
 
-/// The root of a parsed SYON document.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SequenceItem {
+    pub value: Value,
+    pub leading_comments: Vec<String>,
+    pub trailing_comment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MappingEntry {
+    pub key: String,
+    pub value: Value,
+    pub leading_comments: Vec<String>,
+    pub trailing_comment: Option<String>,
+}
+
+/// A sub-document introduced by a ``` fence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
+    pub path: Option<String>,
+    pub format: Option<String>,
     pub body: Value,
-    pub trailing_comments: Vec<Comment>,
+}
+
+/// The top-level parse result: one or more documents.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyonFile {
+    pub documents: Vec<Document>,
 }

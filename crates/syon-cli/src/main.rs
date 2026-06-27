@@ -29,12 +29,11 @@ fn to_json(value: &Value, depth: usize) -> String {
     match value {
         Value::Scalar(s) => serde_json::to_string(s).unwrap(),
         Value::LiteralBlock(s) => serde_json::to_string(s).unwrap(),
-        Value::Mapping(m) => {
-            if m.entries.is_empty() {
+        Value::Mapping(entries) => {
+            if entries.is_empty() {
                 return "{}".into();
             }
-            let pairs: Vec<String> = m
-                .entries
+            let pairs: Vec<String> = entries
                 .iter()
                 .map(|e| {
                     format!(
@@ -46,14 +45,13 @@ fn to_json(value: &Value, depth: usize) -> String {
                 .collect();
             format!("{{\n{}\n{pad}}}", pairs.join(",\n"))
         }
-        Value::Sequence(seq) => {
-            if seq.items.is_empty() {
+        Value::Sequence(items) => {
+            if items.is_empty() {
                 return "[]".into();
             }
-            let elems: Vec<String> = seq
-                .items
+            let elems: Vec<String> = items
                 .iter()
-                .map(|v| format!("{inner}{}", to_json(v, depth + 1)))
+                .map(|item| format!("{inner}{}", to_json(&item.value, depth + 1)))
                 .collect();
             format!("[\n{}\n{pad}]", elems.join(",\n"))
         }

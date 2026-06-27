@@ -1,0 +1,151 @@
+// SYON grammar for pest (PEG)
+//
+// Spacing rule: `:`, `-`, `#` are structural ONLY when followed by ASCII
+// space or newline (or at end-of-input). Otherwise they are literal content.
+
+// ---------------------------------------------------------------------------
+// Whitespace / primitives
+// ---------------------------------------------------------------------------
+
+NEWLINE = _{ "\r\n" | "\n" }
+SP      = _{ " " }
+// Horizontal whitespace (spaces only — tabs in indent are forbidden)
+hspace  = _{ " " }
+// Any character that is not a newline
+not_nl  = _{ !NEWLINE ~ ANY }
+
+// Indentation: zero or more spaces at column 0
+indent = { " "* }
+
+// A single blank line (whitespace only)
+blank_line = _{ " "* ~ NEWLINE }
+
+// ---------------------------------------------------------------------------
+// Forbidden construct detection
+// (These rules are used in error-reporting; the parser rejects them.)
+// ---------------------------------------------------------------------------
+
+forbidden_tag        = { ("!!" | "!") ~ ASCII_ALPHANUMERIC+ }
+forbidden_anchor     = { "&" ~ ASCII_ALPHANUMERIC+ }
+forbidden_alias      = { "*" ~ ASCII_ALPHANUMERIC+ }
+forbidden_doc_start  = { "---" ~ (SP | NEWLINE | EOI) }
+forbidden_complex_key = { "?" ~ (SP | NEWLINE | EOI) }
+forbidden_flow_open  = { "{" | "[" }
+
+// ---------------------------------------------------------------------------
+// Keys
+// ---------------------------------------------------------------------------
+
+// A key is any sequence of non-newline chars that does not start with
+// an operator symbol and is followed by ": " or ":\n" or ":<EOI>"
+key_char = _{ !(":" ~ (SP | NEWLINE | EOI)) ~ not_nl }
+key_body = { key_char+ }
+
+// ---------------------------------------------------------------------------
+// Scalars (plain and double-quoted)
+// ---------------------------------------------------------------------------
+
+dq_escape    = _{ "\\" ~ ANY }
+dq_inner     = _{ dq_escape | (!("\"" | NEWLINE) ~ ANY) }
+dq_scalar    = ${ "\"" ~ dq_inner* ~ "\"" }
+
+// Plain scalar: everything up to an optional inline comment or newline.
+// The spacing rule means `#` is only structural when preceded by a space.
+plain_char   = _{
+    // hash preceded by space → structural (stop before it)
+    !(SP ~ "#" ~ (SP | NEWLINE | EOI)) ~
+    not_nl
+}
+plain_scalar = ${ plain_char+ }
+
+scalar_value = { dq_scalar | plain_scalar }
+
+// ---------------------------------------------------------------------------
+// Inline comment  (trailing on the same line as a key/value)
+// ---------------------------------------------------------------------------
+
+inline_comment_text = { not_nl* }
+inline_comment      = { SP ~ "#" ~ (SP ~ inline_comment_text | &NEWLINE) }
+
+// ---------------------------------------------------------------------------
+// Comment line
+// ---------------------------------------------------------------------------
+
+comment_text = { not_nl* }
+// A full-line comment: indent, then "# " or "#\n"
+comment_line = { indent ~ "#" ~ (SP ~ comment_text | &(NEWLINE | EOI)) ~ (NEWLINE | EOI) }
+
+// ---------------------------------------------------------------------------
+// Literal block  [[[  …  ]]]
+// ---------------------------------------------------------------------------
+
+literal_open    = _{ "[[[" ~ NEWLINE }
+literal_close   = _{ "]]]" }
+// raw line: anything that is NOT the close delimiter
+literal_raw_line = { (!literal_close ~ not_nl)* ~ NEWLINE }
+literal_content  = { literal_raw_line* }
+literal_block    = { literal_open ~ literal_content ~ literal_close ~ (NEWLINE | EOI) }
+
+// ---------------------------------------------------------------------------
+// Document fence (Block 2) — triple-backtick, column 0 only
+// ---------------------------------------------------------------------------
+
+path_char    = _{ !("." | NEWLINE) ~ ANY }
+format_char  = _{ !(NEWLINE) ~ ANY }
+fence_path   = { path_char* }
+fence_format = { format_char+ }
+doc_fence_open  = { "```" ~ fence_path ~ "." ~ fence_format ~ NEWLINE }
+doc_fence_close = { "```" ~ (NEWLINE | EOI) }
+
+// ---------------------------------------------------------------------------
+// Values (recursive)
+// ---------------------------------------------------------------------------
+
+// A value on the same line as a key or list-item marker.
+// It can be a literal block, a nested block (mapping/sequence started on
+// next line — represented here as empty), or a scalar.
+inline_value = { literal_block | scalar_value }
+
+// ---------------------------------------------------------------------------
+// Key-value entry
+// ---------------------------------------------------------------------------
+
+colon_sp = _{ ":" ~ (SP | &NEWLINE | &EOI) }
+
+key_value = {
+    indent ~ key_body ~ colon_sp ~
+    (inline_value ~ inline_comment? | inline_comment | &(NEWLINE | EOI)) ~
+    (NEWLINE | EOI)
+}
+
+// ---------------------------------------------------------------------------
+// Sequence item
+// ---------------------------------------------------------------------------
+
+dash_sp = _{ "-" ~ (SP | &NEWLINE | &EOI) }
+
+list_item = {
+    indent ~ dash_sp ~
+    (inline_value ~ inline_comment? | inline_comment | &(NEWLINE | EOI)) ~
+    (NEWLINE | EOI)
+}
+
+// ---------------------------------------------------------------------------
+// Block: a mapping, sequence, or scalar block
+// ---------------------------------------------------------------------------
+
+block_line = _{
+    blank_line
+  | comment_line
+  | key_value
+  | list_item
+  | literal_block
+  | doc_fence_open
+  | doc_fence_close
+}
+
+// ---------------------------------------------------------------------------
+// Top-level document
+// ---------------------------------------------------------------------------
+
+document = { SOI ~ block_line* ~ EOI }
