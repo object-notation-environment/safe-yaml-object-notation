@@ -1,7 +1,7 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use syon_parser::{parse, Value};
+use syon_parser::Value;
 
 fn value_to_py(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
     match val {
@@ -25,17 +25,16 @@ fn value_to_py(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
     }
 }
 
-/// Parse a SYON string and return a Python dict / list / str.
 #[pyfunction]
-fn parse_syon(py: Python<'_>, input: &str) -> PyResult<PyObject> {
-    let file = parse(input).map_err(|e| PyValueError::new_err(e.to_string()))?;
+fn parse(py: Python<'_>, input: &str) -> PyResult<PyObject> {
+    let file = syon_parser::parse(input).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let first = file.documents.into_iter().next()
         .ok_or_else(|| PyValueError::new_err("no documents"))?;
     value_to_py(py, &first.body)
 }
 
 #[pymodule]
-fn syon_python(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(parse_syon, m)?)?;
+fn syon(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(parse, m)?)?;
     Ok(())
 }
