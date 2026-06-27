@@ -1,0 +1,156 @@
+# SYON Glossary Entry Schema — Convention v0.1.0
+#
+# Each key under `fields` describes one field of a glossary entry document.
+# Schema meta-fields used in this convention:
+#   type:          string | sequence | mapping | sequence-or-mapping | file-ref
+#   required:      required | optional
+#   one-of-group:  name of a mutual constraint group (see `constraints`)
+#   cardinality:   at-least-one | at-most-one  (scoped to the one-of-group)
+#   items:         element type for sequence fields
+
+schema:
+  name: glossary-entry
+  version: 0.1.0
+  description: [[[
+    Defines the field structure and constraints for a SYON glossary entry.
+    Fields marked `required: required` must be present in every conforming
+    entry. Fields sharing a `one-of-group` are mutually constrained as
+    described in the `constraints` section at the bottom of this file.
+  ]]]
+
+fields:
+
+  # ── Identity ─────────────────────────────────────────────────────────────
+  # At least one of `term` or `abbreviation` must be present (one-of: identity).
+
+  term:
+    type: string
+    required: optional
+    one-of-group: identity
+    description: The full human-readable name of the concept.
+
+  abbreviation:
+    type: string
+    required: optional
+    one-of-group: identity
+    description: Short-form abbreviation or acronym for the concept.
+
+  # ── Provenance ────────────────────────────────────────────────────────────
+
+  id:
+    type: string
+    required: required
+    description: Stable machine-readable identifier (e.g. syon-001).
+
+  version:
+    type: string
+    required: required
+    description: The version of the entry or the concept it describes (e.g. 0.9.0).
+
+  # ── Definition ────────────────────────────────────────────────────────────
+
+  description:
+    type: string
+    required: required
+    description: [[[
+      A human-readable definition of the term. May be a plain scalar for a
+      single-sentence definition, or a literal block ([[[...]]]]) for
+      multi-paragraph content.
+    ]]]
+
+  # ── Scope ─────────────────────────────────────────────────────────────────
+
+  contexts:
+    type: sequence
+    required: optional
+    items: string
+    description: Domain tags that scope where this term applies (e.g. data-formats).
+
+  # ── Naming variants ───────────────────────────────────────────────────────
+
+  synonyms:
+    type: sequence-or-mapping
+    required: optional
+    description: [[[
+      Alternative names for the concept.
+      Sequence form: a flat list of synonym strings.
+      Mapping form: keys are context labels, values are the synonym in that context.
+    ]]]
+
+  opposites:
+    type: sequence-or-mapping
+    required: optional
+    description: [[[
+      Contrasting or antonymous concepts.
+      Sequence form: a flat list of contrasting term strings.
+      Mapping form: keys are short labels, values are brief explanations
+      (e.g. full-yaml: "unrestricted YAML with tags, anchors, and implicit typing").
+    ]]]
+
+  # ── Graph edges ───────────────────────────────────────────────────────────
+
+  relationships:
+    type: mapping
+    required: optional
+    description: [[[
+      Typed links to related glossary entries. Keys are relationship role
+      identifiers (e.g. see-also, member-of, inspired-by, supersedes);
+      values are entry ids or sequences of entry ids.
+    ]]]
+
+  # ── Extended discussion ───────────────────────────────────────────────────
+
+  discussion:
+    type: file-ref
+    required: optional
+    description: [[[
+      Relative path to a .md or .syon file containing extended discussion,
+      examples, or rationale. Resolved relative to the entry file per the
+      path-resolution rules in spec/04-glossary-schema.md Section 4.2.
+    ]]]
+
+  # ── Change history ────────────────────────────────────────────────────────
+  # At most one of `history` or `changelogs` may be present (one-of: changelog).
+
+  history:
+    type: mapping
+    required: optional
+    one-of-group: changelog
+    cardinality: at-most-one
+    description: [[[
+      Inline change log as a mapping of ISO-8601 date strings to change
+      description strings (e.g. 2026-06-27: v0.9.0 draft published).
+      Mutually exclusive with `changelogs`.
+    ]]]
+
+  changelogs:
+    type: mapping
+    required: optional
+    one-of-group: changelog
+    cardinality: at-most-one
+    description: [[[
+      Alternative key for the inline change log, used when an entry adopts
+      a plural naming convention. Mutually exclusive with `history`.
+    ]]]
+
+# ── Cross-field constraints ───────────────────────────────────────────────────
+#
+# `one-of` groups express mutual presence constraints between fields.
+# `cardinality` qualifies which direction the constraint runs.
+
+constraints:
+  -
+    rule: one-of
+    group: identity
+    members:
+      - term
+      - abbreviation
+    cardinality: at-least-one
+
+  -
+    rule: one-of
+    group: changelog
+    members:
+      - history
+      - changelogs
+    cardinality: at-most-one

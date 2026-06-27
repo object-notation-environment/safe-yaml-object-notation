@@ -1,0 +1,26 @@
+abbreviation: SYON
+term: Safe YAML Object Notation
+id: syon-001
+version: 0.9.0
+description: [[[
+  A human-writable data serialization format that is safe (no implicit
+  typing, no executable constructs), simple (a small fixed set of markers),
+  and structured (keys, lists, nesting). A member of the ONE family.
+]]]
+contexts:
+  - data-formats
+  - serialization
+  - one-family
+synonyms:
+  - safe yaml subset
+opposites:
+  full-yaml: unrestricted YAML with tags, anchors, and implicit typing
+relationships:
+  see-also: yaml-001
+  member-of: one-family
+  inspired-by:
+    - strictyaml-001
+    - nestedtext-001
+discussion: syon-discussion.md
+history:
+  2026-06-27: v0.9.0 draft published
